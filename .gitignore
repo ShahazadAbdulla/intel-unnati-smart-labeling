@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files (optional - you might want to track an empty one or a sample)
+# If you don't want to track the log file at all:
+traceability_log.csv
+
+# Data files (optional - if your products.csv is small and part of the setup, track it)
+# If your label_images become very large, you might ignore them,
+# but for a few small samples, it's okay to track.
+
+# OS specific
+.DS_Store
+Thumbs.db
