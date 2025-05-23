@@ -2,10 +2,12 @@ import datetime     # for time stamps
 import csv          # for creating the log file
 import os           # for finding path
 import pandas as pd #
+import cv2          #OpenCV
+from pyzbar.pyzbar import decode #QR code decode 
 
-LOG_FILE = 'traceability_log.csv'   # for the results storing
-PRODUCT_DATA_FILE = 'products.csv'  # for taking the products list to verify
-# label.csv will be created later
+LOG_FILE = 'traceability_log.csv'       # for the results storing
+PRODUCT_DATA_FILE = 'products.csv'      # for taking the products list to verify
+LABEL_IMAGE_FOLDER = 'label_images/'    # label image folder
 
 print ("Smart Labeling System Initializing... ")
 
@@ -34,6 +36,36 @@ def load_product_data(file_path):
         print(f"ERROR: Could not read product data file '{file_path}': {e}")
         return [] #return an empty list on all other errors
     
+#get label images path
+def get_label_image_path(product_data, base_folder):
+    expected_serial = product_data.get('Expected_SerialNumber_QR')
+
+    #specific cases
+    if expected_serial == 'SN004_MISMATCH':
+        image_filename = 'SN004.png'
+    elif expected_serial == 'SN_FAIL_BLURRY_EXPECTED':
+        image_filename = 'SN_FAIL_BLURRY.png'
+    else:
+        image_filename = f"{expected_serial}.png"
+
+    image_path = os.path.join(base_folder, image_filename)
+    return image_path
+
+#function to read QR code
+def read_qr_code_from_image(cv2_image_object):
+    if cv2_image_object is None:
+        return False, None, "ERROR: Image object is None, cannot read QR"
+    
+    try:
+        decoded_objects = decode(cv2_image_object)
+        if decoded_objects:
+            qr_data = decoded_objects[0].data.decode('utf-8') #pyzbar decode function
+            return True, qr_data, f"SUCCESS: QR decoded data: {qr_data}"
+        else:
+            return False, None, "FAIL: No QR code found or could not be decoded"
+    except Exception as e:
+        return False, None, "ERROR: Excepion during QR code decoding: {e}"
+    
 #verifying compliance
 def verify_compliance(product_data):
     """check compliance for MVP RoHS is checked to be T/F and logged"""
@@ -56,7 +88,7 @@ def verify_compliance(product_data):
 #function to initialize log file
 def initialize_log_file():
     """creates the log file and initialize the headers if it doesnt exist"""
-    fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'OverallStatus', 'ActionDetails']
+    fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'QR_DataRead', 'QR_MatchStatus', 'OCR_Details', 'OverallStatus', 'ActionDetails']
 
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w', newline='') as csvfile:
@@ -67,7 +99,7 @@ def initialize_log_file():
         print(f"Log file '{LOG_FILE}' already existed. Header not rewritten")
 
 #function to log an event
-def log_event(device_id, batch_id, compliance_details, overall_status, action_details):
+def log_event(device_id, batch_id, compliance_details, qr_data_read, qr_match_status, ocr_details, overall_status, action_details):
     """Logs an event (for one products processing result) to the CSV file"""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = {
@@ -75,11 +107,14 @@ def log_event(device_id, batch_id, compliance_details, overall_status, action_de
         'DeviceID': device_id,
         'BatchID': batch_id,
         'ComplianceDetails': compliance_details,
+        'QR_DataRead': qr_data_read,
+        'QR_MatchStatus': qr_match_status,
+        'OCR_Details': ocr_details,
         'OverallStatus': overall_status,
         'ActionDetails': action_details
     }
     with open(LOG_FILE, 'a', newline='') as csvfile:
-        fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'OverallStatus', 'ActionDetails']
+        fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'QR_DataRead', 'QR_MatchStatus', 'OCR_Details', 'OverallStatus', 'ActionDetails']
         writer = csv.DictWriter(csvfile, fieldnames=fieldNames)
         writer.writerow(log_entry)
     print(f"Logged: {device_id} - {overall_status} (compliance: {compliance_details})")
@@ -89,7 +124,7 @@ if __name__ == "__main__":
     initialize_log_file() # call this once in the beginning
     product_list = load_product_data(PRODUCT_DATA_FILE)
 
-    if not property:
+    if not product_list:
         print("Exiting as no product data could be loaded")
     else:
         print(f"\nStarting process for {len(product_list)} products from CSV...")
@@ -100,10 +135,10 @@ if __name__ == "__main__":
             # extract basic info
             device_id = product_info['DeviceID']
             batch_id = product_info['BatchID']
+            expected_serial_from_csv = product_info.get('Expected_SerialNumber_QR', 'N/A_EXPECTED_SERIAL')
 
             #other fields
             rohs_compliant = product_info['RoHS_Compliant']
-            expected_qr = product_info['Expected_SerialNumber_QR']
 
             print(f"\n--- Processing product: {device_id} (Batch: {batch_id}) ---")
 
@@ -113,6 +148,11 @@ if __name__ == "__main__":
 
             #STEP 2: Verifying compliance
             is_compliant, compliance_log_msg = verify_compliance(product_info)
+
+            #initialize AI check var
+            qr_read_success = False
+            actual_qr_data = None
+            qr_validation_msg = "QR_CHECK_SKIPPED_DUE_TO_COMPLIANCE_FAIL"
 
             #if compliance failed log and skip to the next product
             if not is_compliant:
@@ -124,6 +164,9 @@ if __name__ == "__main__":
                     device_id=device_id,
                     batch_id=batch_id,
                     compliance_details=compliance_log_msg,
+                    qr_data_read=actual_qr_data,
+                    qr_match_status=qr_validation_msg,
+                    ocr_details=ocr_read_placeholder,
                     overall_status=overall_product_status,
                     action_details=action_details
                 )
@@ -132,25 +175,54 @@ if __name__ == "__main__":
                 print(f"--- product {device_id} process is halted due to compliance failure ---")
                 continue
 
-            #STEP 3: Load label image
-            print(f" STEP 3: Simulating loading label image for {device_id}...")
+            #STEP 3: Load label image 
+            print(f" STEP 3: Loading label image for {device_id}...")
+            label_image_path = get_label_image_path(product_info, LABEL_IMAGE_FOLDER)
 
-            #STEP 4: AI label check (QR and OCR)
-            print(f" STEP 4a: Simulating QR code read for {device_id}...")
-            qr_read_placeholder = "PENDING_QR_READ" 
+            if not os.path.exists(label_image_path):
+                print(f"ERROR: label image not found at '{label_image_path}'")
+                qr_validation_msg = "FAIL_IMAGE_NOT_FOUND"
+            else:
+                cv_image = cv2.imread(label_image_path)
+                if cv_image is None:
+                    print(f"    ERROR: Could not load image from '{label_image_path}' using OpenCV.")
+                    qr_validation_msg = "FAIL_IMAGE_LOAD_ERROR"
+                else:
+                    print(f"   SUCCESS: Label image '{label_image_path}' loaded.")
+                    # Step 4a: AI - Read QR Code
+                    print(f"    STEP 4a: Attempting QR Code Read for {device_id}...")
+                    qr_read_success, actual_qr_data, qr_decode_msg = read_qr_code_from_image(cv_image)
+                    print(f"    QR Read attempt result: {qr_decode_msg}")
+                    qr_validation_msg = qr_decode_msg # For logging the raw decode message                
+
+            #STEP 4b: AI label check (OCR)
             print(f" STEP 4b: Simulating OCR text read for {device_id}...")
             ocr_read_placeholder = "PENDING_OCR_READ"
 
-            #STEP 5: Overall decision
-            overall_product_status_if_compliant = "PENDING_AI_CHECKS"
+            #STEP 5: Overall decision(includes QR)
+            qr_content_matches_expected = False
+            if qr_read_success and actual_qr_data is not None:
+                if actual_qr_data == expected_serial_from_csv:
+                    qr_content_matches_expected = True
+                    qr_validation_msg = " MATCH"
+                else:
+                    qr_validation_msg = f"MISMATCH (Exp:{expected_serial_from_csv},Got:{actual_qr_data})"
+            elif cv_image is not None and not qr_read_success:
+                qr_validation_msg = "NO_QR_DETECTED"
+
+            #over product status
+            if is_compliant and qr_read_success and qr_content_matches_expected:
+                overall_product_status = "ACCEPTED"
+                action_details = "All check passed (Compliance, QR read and match). Product accepted"
+            elif is_compliant and (not qr_read_success or not qr_content_matches_expected):
+                overall_product_status = "REJECTED"
+                action_details = f"Product rejected after AI check. Compliance: OK, QR status: {qr_validation_msg}"
 
             #STEP 6: Simulate Actuator action
-            action_details_if_compliant =  "Compliance is okay. Awaiting AI label validation"
-
-            print(f"Simulating actuator action: {action_details_if_compliant}")
+            print(f"    ACTION_SIM: {action_details}")
 
             #log the details for now as in placeholder for the product
-            log_event(device_id=device_id, batch_id=batch_id, compliance_details=compliance_log_msg, overall_status=overall_product_status_if_compliant, action_details=action_details_if_compliant)
+            log_event(device_id=device_id, batch_id=batch_id, compliance_details=compliance_log_msg, qr_data_read=actual_qr_data, qr_match_status=qr_validation_msg, ocr_details=ocr_read_placeholder, overall_status=overall_product_status, action_details=action_details)
 
         print("\n--- All Sample Products Processed ---")
         print(f"Check '{LOG_FILE}' for details")
