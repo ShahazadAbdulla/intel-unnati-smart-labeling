@@ -4,6 +4,7 @@ import os           # for finding path
 import pandas as pd #
 import cv2          #OpenCV
 from pyzbar.pyzbar import decode #QR code decode 
+import easyocr 
 
 LOG_FILE = 'traceability_log.csv'       # for the results storing
 PRODUCT_DATA_FILE = 'products.csv'      # for taking the products list to verify
@@ -11,12 +12,31 @@ LABEL_IMAGE_FOLDER = 'label_images/'    # label image folder
 
 print ("Smart Labeling System Initializing... ")
 
-#hardcoded sample data
-# sample_product_data = [
-#     {'DeviceID': 'ELEC001', 'BatchID': 'B001', 'Expected_SerialNumber_QR': 'SN001'},
-#     {'DeviceID': 'ELEC002', 'BatchID': 'B001', 'Expected_SerialNumber_QR': 'SN002'},
-#     {'DeviceID': 'ELEC003', 'BatchID': 'B002', 'Expected_SerialNumber_QR': 'SN003'}
-# ]
+#Initializing EasyOCR (once)
+print("Initializing EasyOCR reader... (May take some time)")
+try:
+    easyocr_reader = easyocr.Reader(['en'], gpu=True)    
+    print("EasyOCR reader initialized successfully")
+except Exception as e:
+    pritn(f"ERROR: Failed to initialize EasyOCR Reader: {e}")
+    easyocr_reader = None #set to none so we can check once and skip later.
+
+#function to Read text with EasyOCR
+def read_text_with_easyrocr(cv2_image_object, reader):
+    if reader is None:
+        return False, [], "SKIPPED: EasyOCR reader is not initialized"
+    if cv2_image_object is None:
+        return False, [], "SKIPPED: Image object is None, cannot perform OCR"
+    
+    try:
+        ocr_result = reader.readtext(cv2_image_object)
+        if ocr_result:
+            detected_texts = [result[1] for result in ocr_result]
+            return True, detected_texts, f"SUCCESS: OCR found text: {detected_texts}"
+        else:
+            return False, [], "INFO: No text found by OCR"
+    except Exception as e:
+        return False, [], f"ERROR: Exception during OCR processing: {e}"
 
 #function to load the products
 def load_product_data(file_path):
@@ -88,7 +108,7 @@ def verify_compliance(product_data):
 #function to initialize log file
 def initialize_log_file():
     """creates the log file and initialize the headers if it doesnt exist"""
-    fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'QR_DataRead', 'QR_MatchStatus', 'OCR_Details', 'OverallStatus', 'ActionDetails']
+    fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'QR_DataRead', 'QR_MatchStatus', 'OCR_TextRead', 'OCR_Status', 'OverallStatus', 'ActionDetails']
 
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w', newline='') as csvfile:
@@ -99,7 +119,7 @@ def initialize_log_file():
         print(f"Log file '{LOG_FILE}' already existed. Header not rewritten")
 
 #function to log an event
-def log_event(device_id, batch_id, compliance_details, qr_data_read, qr_match_status, ocr_details, overall_status, action_details):
+def log_event(device_id, batch_id, compliance_details, qr_data_read, qr_match_status, ocr_text_read, ocr_status, overall_status, action_details):
     """Logs an event (for one products processing result) to the CSV file"""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = {
@@ -107,17 +127,18 @@ def log_event(device_id, batch_id, compliance_details, qr_data_read, qr_match_st
         'DeviceID': device_id,
         'BatchID': batch_id,
         'ComplianceDetails': compliance_details,
-        'QR_DataRead': qr_data_read,
+        'QR_DataRead': qr_data_read if qr_data_read is not None else "N/A",
         'QR_MatchStatus': qr_match_status,
-        'OCR_Details': ocr_details,
+        'OCR_TextRead': str(ocr_text_read) if ocr_text_read else "N/A",
+        'OCR_Status' : ocr_status,
         'OverallStatus': overall_status,
         'ActionDetails': action_details
     }
     with open(LOG_FILE, 'a', newline='') as csvfile:
-        fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'QR_DataRead', 'QR_MatchStatus', 'OCR_Details', 'OverallStatus', 'ActionDetails']
+        fieldNames = ['Timestamp', 'DeviceID', 'BatchID', 'ComplianceDetails', 'QR_DataRead', 'QR_MatchStatus', 'OCR_TextRead', 'OCR_Status', 'OverallStatus', 'ActionDetails']
         writer = csv.DictWriter(csvfile, fieldnames=fieldNames)
         writer.writerow(log_entry)
-    print(f"Logged: {device_id} - {overall_status} (compliance: {compliance_details})")
+    print(f"Logged: {device_id} - {overall_status} (compliance: {compliance_details}, QR: {qr_match_status}, OCR:{ocr_status})")
 
 #main function
 if __name__ == "__main__":
@@ -149,10 +170,15 @@ if __name__ == "__main__":
             #STEP 2: Verifying compliance
             is_compliant, compliance_log_msg = verify_compliance(product_info)
 
-            #initialize AI check var
+            #initialize QR check var
             qr_read_success = False
             actual_qr_data = None
             qr_validation_msg = "QR_CHECK_SKIPPED_DUE_TO_COMPLIANCE_FAIL"
+
+            #initialize OCR check var
+            ocr_read_success = False
+            actual_ocr_text_read = [] #list of strings
+            ocr_status_msg = "OCR_SKIPPED_DUE_TO_PREVIOUS_FAIL" #defualt is QR or compliance fail
 
             #if compliance failed log and skip to the next product
             if not is_compliant:
@@ -166,7 +192,8 @@ if __name__ == "__main__":
                     compliance_details=compliance_log_msg,
                     qr_data_read=actual_qr_data,
                     qr_match_status=qr_validation_msg,
-                    ocr_details=ocr_read_placeholder,
+                    ocr_text_read=actual_ocr_text_read,
+                    ocr_status=ocr_status_msg,
                     overall_status=overall_product_status,
                     action_details=action_details
                 )
@@ -197,7 +224,16 @@ if __name__ == "__main__":
 
             #STEP 4b: AI label check (OCR)
             print(f" STEP 4b: Simulating OCR text read for {device_id}...")
-            ocr_read_placeholder = "PENDING_OCR_READ"
+            if easyocr_reader and cv_image is not None: #only proceed if both are valid
+                ocr_read_success, actual_ocr_text_read, ocr_decode_msg = read_text_with_easyrocr(cv_image, easyocr_reader)
+                ocr_status_msg = ocr_decode_msg #detailed outcome
+                print(f"    OCR read attempt result: {ocr_status_msg}")
+            elif not easyocr_reader:
+                ocr_status_msg = "SKIPPED: EasyOCR reader not available"
+                print(f"    {ocr_status_msg}")
+            else: #cv image must be none
+                ocr_status_msg = "SKIPPED: No valid image for OCR"
+                print(f"    {ocr_status_msg}")
 
             #STEP 5: Overall decision(includes QR)
             qr_content_matches_expected = False
@@ -218,11 +254,28 @@ if __name__ == "__main__":
                 overall_product_status = "REJECTED"
                 action_details = f"Product rejected after AI check. Compliance: OK, QR status: {qr_validation_msg}"
 
+            #OCR status
+            if "REJECTED" not in overall_product_status:
+                if ocr_read_success:
+                    action_details += f" OCR found: {actual_ocr_text_read}."
+                else: 
+                    action_details += f" OCR satus: {ocr_status_msg}."
+
             #STEP 6: Simulate Actuator action
             print(f"    ACTION_SIM: {action_details}")
 
             #log the details for now as in placeholder for the product
-            log_event(device_id=device_id, batch_id=batch_id, compliance_details=compliance_log_msg, qr_data_read=actual_qr_data, qr_match_status=qr_validation_msg, ocr_details=ocr_read_placeholder, overall_status=overall_product_status, action_details=action_details)
+            log_event(
+                device_id=device_id, 
+                batch_id=batch_id, 
+                compliance_details=compliance_log_msg, 
+                qr_data_read=actual_qr_data, 
+                qr_match_status=qr_validation_msg, 
+                ocr_text_read=actual_ocr_text_read, 
+                ocr_status=ocr_status_msg,
+                overall_status=overall_product_status, 
+                action_details=action_details
+                )
 
         print("\n--- All Sample Products Processed ---")
         print(f"Check '{LOG_FILE}' for details")
